@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Demo comparing Intel vs Graviton EC2 performance'
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+    
+  ImageTag:
+    Type: String
+    Default: 'latest'
+    Description: Image tag to deploy
+
+Resources:
+  # ECR Repository
+  DemoRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: graviton-demo-app
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: graviton-demo-repository
+
+  # VPC and Networking
+  DemoVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: graviton-demo-vpc
+
+  DemoSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DemoVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: graviton-demo-subnet
+
+  DemoInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: graviton-demo-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref DemoVPC
+      InternetGatewayId: !Ref DemoInternetGateway
+
+  DemoRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref DemoVPC
+      Tags:
+        - Key: Name
+          Value: graviton-demo-rt
+
+  DemoRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref DemoRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref DemoInternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DemoSubnet
+      RouteTableId: !Ref DemoRouteTable
+
+  # Security Group
+  DemoSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Graviton demo instances
+      VpcId: !Ref DemoVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: graviton-demo-sg
+
+  # IAM Role for CloudWatch
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: graviton-demo-role
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # Intel Instance (t3.small for cost efficiency)
+  IntelInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-016ff47edc0224f3c  # Amazon Linux 2023 x86_64
+      InstanceType: t3.small
+      KeyName: !Ref KeyName
+      SubnetId: !Ref DemoSubnet
+      SecurityGroupIds:
+        - !Ref DemoSecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y docker
+          systemctl start docker
+          systemctl enable docker
+          usermod -a -G docker ec2-user
+          
+          # Install CloudWatch agent
+          wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+          rpm -U ./amazon-cloudwatch-agent.rpm
+          
+          
+          # Login to ECR and pull image
+          aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+          
+          # Pull and run Intel-specific demo app
+          docker pull ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DemoRepository}:intel-${ImageTag}
+          docker run -d -p 8080:8080 --name demo-app ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DemoRepository}:intel-${ImageTag}
+      Tags:
+        - Key: Name
+          Value: intel-demo-instance
+        - Key: Architecture
+          Value: x86_64
+
+  # Graviton Instance (t4g.small for cost efficiency)
+  GravitonInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-07120d773b79e1e1d  # Amazon Linux 2023 ARM64
+      InstanceType: t4g.small
+      KeyName: !Ref KeyName
+      SubnetId: !Ref DemoSubnet
+      SecurityGroupIds:
+        - !Ref DemoSecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y docker
+          systemctl start docker
+          systemctl enable docker
+          usermod -a -G docker ec2-user
+          
+          # Install CloudWatch agent
+          wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/arm64/latest/amazon-cloudwatch-agent.rpm
+          rpm -U ./amazon-cloudwatch-agent.rpm
+          
+          
+          # Login to ECR and pull image
+          aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+          
+          # Pull and run Graviton-specific demo app
+          docker pull ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DemoRepository}:graviton-${ImageTag}
+          docker run -d -p 8080:8080 --name demo-app ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DemoRepository}:graviton-${ImageTag}
+      Tags:
+        - Key: Name
+          Value: graviton-demo-instance
+        - Key: Architecture
+          Value: arm64
+
+Outputs:
+  ECRRepository:
+    Description: ECR Repository URI
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DemoRepository}'
+    
+  IntelInstancePublicIP:
+    Description: Public IP of Intel instance
+    Value: !GetAtt IntelInstance.PublicIp
+    
+  GravitonInstancePublicIP:
+    Description: Public IP of Graviton instance
+    Value: !GetAtt GravitonInstance.PublicIp
+    
+  IntelInstanceDNS:
+    Description: Public DNS of Intel instance
+    Value: !GetAtt IntelInstance.PublicDnsName
+    
+  GravitonInstanceDNS:
+    Description: Public DNS of Graviton instance
+    Value: !GetAtt GravitonInstance.PublicDnsName
+    
+  SSHCommand:
+    Description: SSH command template
+    Value: !Sub 'ssh -i your-key.pem ec2-user@<instance-ip>'
+    
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for both instances
+    Value: 'Approximately $30-35/month for both t3.small and t4g.small instances'
